@@ -1,6 +1,12 @@
 # caveman-portable
 
-Makes Claude Code and Codex reply in caveman style: compressed prose with no articles, filler or pleasantries, while code, paths, errors and numbers stay exact. It applies to the main conversation and to every sub-agent, on any device with Node.js. It does not need Orca, memory plugins or any particular IDE.
+Makes Claude Code and Codex reply in caveman style: compressed prose with no articles, filler or pleasantries, while code, paths, errors and numbers stay exact. It applies to the main conversation and to every sub-agent, on any device with Node.js. It does not need an IDE, memory plugins or a GitHub login.
+
+```
+npx -y caveman-portable
+```
+
+That single line sets up a device on Windows, macOS or Linux. Restart any open Claude Code or Codex sessions afterwards.
 
 ## Requirements
 
@@ -11,26 +17,26 @@ Makes Claude Code and Codex reply in caveman style: compressed prose with no art
 
 ## Install
 
-### One line (Windows, macOS or Linux, with Node.js 18+)
+### One line
 
-- From the private GitHub repo. The device needs GitHub access to it, for example via `gh auth login`:
-  `npx -y github:DEV-Johnstocker/caveman-portable`
-- From npm, once the package is published there (no login needed):
-  `npx -y caveman-portable`
+- From npm: `npx -y caveman-portable`
+- From GitHub: `npx -y github:kulovema2012/caveman-portable`
 
 With no command it runs `install`. Flags and commands still work after it, for example `npx -y caveman-portable --dry-run` or `npx -y caveman-portable verify`. npx runs the installer from its cache, and the installer copies everything into your home folder, so nothing depends on the cache afterwards.
 
-### From a copy of this folder
+To pin an exact release on a machine you care about, add the version: `npx -y caveman-portable@1.0.0`.
 
-Copy this folder to the device, then run one of:
+### From a clone
 
-- Windows: `powershell -ExecutionPolicy Bypass -File install.ps1`
-- macOS / Linux: `sh install.sh`
-- Anywhere: `node caveman.mjs install`
+```
+git clone https://github.com/kulovema2012/caveman-portable.git
+cd caveman-portable
+node caveman.mjs install
+```
 
-Add `--dry-run` to preview, or `--only claude` / `--only codex` to limit it to one tool. Afterwards, restart any open Claude Code or Codex sessions and run `node caveman.mjs verify`.
+`install.ps1` (Windows) and `install.sh` (macOS / Linux) are thin wrappers that check for Node.js first.
 
-Running install again is safe. It only changes what differs from the payload, and otherwise reports "already up to date".
+Add `--dry-run` to preview, or `--only claude` / `--only codex` to limit it to one tool. Running install again is safe. It only changes what differs from the payload, and otherwise reports "already up to date".
 
 ## What it changes
 
@@ -41,13 +47,14 @@ Running install again is safe. It only changes what differs from the payload, an
 | `~/.claude/settings.json` | sets `outputStyle` to `"Caveman"`; adds one SubagentStart hook group (exec form, using this device's node binary); disables `explanatory-output-style` if it is enabled | Merged: every other setting and hook is left alone |
 | `~/.agents/skills/caveman/SKILL.md` | copied | Shared skill. Codex reads this folder natively |
 | `~/.claude/skills/caveman` | link to the shared skill (a junction on Windows) | Claude doesn't read `~/.agents/skills` |
+| `~/.agents/.skill-lock.json` | removes only its `caveman` entry, if present | Otherwise `npx skills update` could put an upstream caveman back over this one |
 | `~/.codex/AGENTS.md` | caveman section between `<!-- caveman:start -->` and `<!-- caveman:end -->`, placed at the top when new | Codex main agent and sub-agents. The rest of the file is left alone |
 | `~/.codex/config.toml` | `multi_agent = true` under `[features]` | On by default since 0.147; pinned so it stays explicit |
 | `~/.codex/skills/caveman` | a separate real copy is moved to the backup | Otherwise Codex would load two caveman skills |
 
 Everything it overwrites or moves goes to `~/.caveman-backups/<timestamp>/` first.
 
-`CLAUDE_CONFIG_DIR` is honoured if set. `CODEX_HOME` deliberately is not: IDEs such as Orca point it at a per-launch runtime home. The setup therefore lives in `~/.codex`, where Codex looks when nothing overrides it. `verify` tells you if the current shell's `CODEX_HOME` does not link back to it.
+`CLAUDE_CONFIG_DIR` is honoured if set. `CODEX_HOME` deliberately is not: some IDEs point it at a per-launch runtime home. The setup therefore lives in `~/.codex`, where Codex looks when nothing overrides it. `verify` tells you if the current shell's `CODEX_HOME` does not link back to it.
 
 ## Why these layers
 
@@ -56,21 +63,40 @@ Everything it overwrites or moves goes to `~/.caveman-backups/<timestamp>/` firs
 - **`AGENTS.md`** is loaded by every Codex agent, the main one and each spawned sub-agent.
 - The **skill** tells the main agent to also put a caveman protocol block into each sub-agent prompt. This is a second layer; the first three work without it.
 
-All of it was tested with Orca's environment removed and with every memory mechanism off (Claude auto-memory, the `remember` and `context-mode` plugins, and Codex `memories`). The main agents and sub-agents in both tools still replied in caveman.
+All of it was tested with no IDE environment and with every memory mechanism off (Claude auto-memory, the `remember` and `context-mode` plugins, and Codex `memories`). The main agents and sub-agents in both tools still replied in caveman.
+
+## If a caveman skill is already installed
+
+| Existing caveman | What happens |
+|---|---|
+| Real copy in `~/.claude/skills/caveman` or `~/.codex/skills/caveman` | Moved to the backup and replaced by the shared skill |
+| Installed by `npx skills` (for example from `mattpocock/skills`) | Overwritten, with the original in the backup, and dropped from the skills lock file so an update can't revert it |
+| A link to somewhere else | Re-pointed to the shared skill; the old target is not touched |
+| In a project's `.claude/skills/` | Claude Code runs the personal skill over a project skill with the same name, so this one wins |
+| Shipped by a plugin (`/plugin:caveman`) | Both load, because plugin skills are namespaced. `verify` warns so you can disable the plugin if its rules conflict |
+| Enterprise-managed skill | The enterprise skill wins. The output style, hook and `AGENTS.md` still apply |
 
 ## Verify
 
-`node caveman.mjs verify` checks every piece and runs the hook once. Add `--live` to also run one real Codex prompt and one real Claude Code prompt that each spawn a sub-agent. This uses a few requests on your subscriptions, and you judge the replies by eye.
+`node caveman.mjs verify` (or `npx -y caveman-portable verify`) checks every piece, runs the hook once, and warns about neighbouring caveman skills. Add `--live` to also run one real Codex prompt and one real Claude Code prompt that each spawn a sub-agent. This uses a few requests on your subscriptions, and you judge the replies by eye.
 
-## Keep the bundle current
+## Changing the style
 
-`payload/` is a snapshot. After changing the style, hook, skill or AGENTS section on a configured device, run `node caveman.mjs export` there. It copies the live files back into `payload/`; then carry the updated folder to your other devices. `verify` warns when a device has drifted from the payload.
+`payload/` is what gets installed. After changing the style, hook, skill or AGENTS section on a configured device, run `node caveman.mjs export` in a clone. It copies the live files back into `payload/`; commit the change, then re-run the installer on your other devices.
 
 ## Uninstall
 
-`node caveman.mjs uninstall` removes the output style, the hook, the settings entries, the skill link and the AGENTS section, with backups. It leaves `multi_agent` alone (Codex's default anyway) and does not re-enable the explanatory plugin.
+`node caveman.mjs uninstall` (or `npx -y caveman-portable uninstall`) removes the output style, the hook, the settings entries, the skill link and the AGENTS section, with backups. It leaves `multi_agent` alone (Codex's default anyway), does not re-enable the explanatory plugin, and does not restore the skills lock entry.
 
 ## Known overwrite risks
 
-- `npx skills update` can replace `~/.agents/skills/caveman` with an upstream version if the skills CLI tracks it in `~/.agents/.skill-lock.json`. Re-run install afterwards.
-- context-mode upgrades may regenerate `~/.codex/AGENTS.md`. Re-running install restores only the caveman section, thanks to the markers.
+- Tools that rewrite `~/.codex/AGENTS.md` (context-mode upgrades, for example) can drop the section. Re-running install restores only the caveman section, thanks to the markers.
+- A plugin or IDE that re-adds its own caveman skill can show up again. `verify` flags it.
+
+## Credits
+
+The caveman idea and its first skill come from [mattpocock/skills](https://github.com/mattpocock/skills) (MIT). This package rewrites the skill for both Claude Code and Codex and adds the output style, the sub-agent hook and the installer.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

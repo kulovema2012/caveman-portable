@@ -310,9 +310,28 @@ function requirePayload() {
   }
 }
 
+// The `npx skills` CLI records what it installed. If it still tracks caveman, `npx skills update` can quietly put
+// the upstream version back over this one. Dropping just that entry stops it; the skill folder stays.
+function dropSkillLockEntry() {
+  const lockPath = path.join(HOME, '.agents', '.skill-lock.json');
+  const raw = read(lockPath);
+  if (raw === null) return;
+  let lock;
+  try {
+    lock = JSON.parse(raw);
+  } catch {
+    console.warn(`note: ${lockPath} is not valid JSON; left as is`);
+    return;
+  }
+  if (!lock?.skills?.caveman) return;
+  delete lock.skills.caveman;
+  writeText(lockPath, JSON.stringify(lock, null, 2) + '\n', 'stop `npx skills update` from reverting the caveman skill');
+}
+
 function install() {
   requirePayload();
   writeText(FILES.skill[1], read(FILES.skill[0]), 'shared skill: Claude via link, Codex natively');
+  dropSkillLockEntry();
   if (forClaude) {
     writeText(FILES.style[1], read(FILES.style[0]), 'output style: main conversation and forks');
     writeText(FILES.hook[1], read(FILES.hook[0]), 'SubagentStart hook: every other sub-agent');
@@ -461,9 +480,69 @@ function liveTests() {
   }
 }
 
+// Plugin skills are namespaced (/plugin:caveman), so a plugin's caveman loads next to this one rather than
+// replacing it. Cache layout for both tools: <cache>/<marketplace>/<plugin>/<version>/skills/<skill>/SKILL.md
+function pluginsWithCavemanSkill(cacheRoot) {
+  const subdirs = (p) => {
+    try {
+      return fs.readdirSync(p, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+    } catch {
+      return [];
+    }
+  };
+  const found = new Set();
+  for (const market of subdirs(cacheRoot)) {
+    for (const plugin of subdirs(path.join(cacheRoot, market))) {
+      for (const version of subdirs(path.join(cacheRoot, market, plugin))) {
+        if (fs.existsSync(path.join(cacheRoot, market, plugin, version, 'skills', 'caveman', 'SKILL.md'))) {
+          found.add(`${plugin}@${market}`);
+        }
+      }
+    }
+  }
+  return [...found];
+}
+
+function verifyNeighbours() {
+  let tracked = false;
+  try {
+    tracked = Boolean(JSON.parse(read(path.join(HOME, '.agents', '.skill-lock.json')) ?? '{}')?.skills?.caveman);
+  } catch {
+    // unreadable lock file: nothing to warn about
+  }
+  check(
+    tracked ? 'warn' : 'ok',
+    'npx-skills lock does not track caveman',
+    tracked ? '`npx skills update` could revert the skill; run install to drop the entry' : '',
+  );
+  if (forClaude) {
+    let enabled = {};
+    try {
+      enabled = loadSettings().data.enabledPlugins ?? {};
+    } catch {
+      // settings.json problems are reported by verifyClaude
+    }
+    const active = pluginsWithCavemanSkill(path.join(CLAUDE_DIR, 'plugins', 'cache')).filter((id) => enabled[id] === true);
+    check(
+      active.length ? 'warn' : 'ok',
+      'no enabled Claude plugin ships its own caveman skill',
+      active.length ? `${active.join(', ')} also loads a caveman skill; disable it if its rules conflict` : '',
+    );
+  }
+  if (forCodex) {
+    const installed = pluginsWithCavemanSkill(path.join(CODEX_DIR, 'plugins', 'cache'));
+    check(
+      installed.length ? 'warn' : 'ok',
+      'no Codex plugin ships its own caveman skill',
+      installed.length ? `${installed.join(', ')} includes a caveman skill; disable it in config.toml if its rules conflict` : '',
+    );
+  }
+}
+
 function verify() {
   requirePayload();
   compareToPayload('shared caveman skill', FILES.skill);
+  verifyNeighbours();
   if (forClaude) verifyClaude();
   if (forCodex) verifyCodex();
   const width = Math.max(...results.map((r) => r.label.length));

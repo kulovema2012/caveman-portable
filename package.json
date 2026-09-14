@@ -20,9 +20,13 @@
     "output-style",
     "caveman"
   ],
-  "license": "UNLICENSED",
+  "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/DEV-Johnstocker/caveman-portable.git"
+    "url": "git+https://github.com/kulovema2012/caveman-portable.git"
+  },
+  "homepage": "https://github.com/kulovema2012/caveman-portable#readme",
+  "bugs": {
+    "url": "https://github.com/kulovema2012/caveman-portable/issues"
   }
 }
