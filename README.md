@@ -11,6 +11,17 @@ Makes Claude Code and Codex reply in caveman style: compressed prose with no art
 
 ## Install
 
+### One line (Windows, macOS or Linux, with Node.js 18+)
+
+- From the private GitHub repo. The device needs GitHub access to it, for example via `gh auth login`:
+  `npx -y github:DEV-Johnstocker/caveman-portable`
+- From npm, once the package is published there (no login needed):
+  `npx -y caveman-portable`
+
+With no command it runs `install`. Flags and commands still work after it, for example `npx -y caveman-portable --dry-run` or `npx -y caveman-portable verify`. npx runs the installer from its cache, and the installer copies everything into your home folder, so nothing depends on the cache afterwards.
+
+### From a copy of this folder
+
 Copy this folder to the device, then run one of:
 
 - Windows: `powershell -ExecutionPolicy Bypass -File install.ps1`

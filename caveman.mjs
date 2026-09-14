@@ -17,7 +17,8 @@ import { fileURLToPath } from 'node:url';
 const BUNDLE = path.dirname(fileURLToPath(import.meta.url));
 const PAYLOAD = path.join(BUNDLE, 'payload');
 const argv = process.argv.slice(2);
-const command = argv[0];
+// No command means install, so the one-liner `npx -y caveman-portable` sets a device up directly.
+const command = argv[0] === undefined || argv[0].startsWith('--') ? 'install' : argv[0];
 const hasFlag = (name) => argv.includes(name);
 const optionValue = (name) => {
   const i = argv.indexOf(name);
@@ -476,7 +477,9 @@ function verify() {
 
 // ---------- main ----------
 
-const USAGE = 'usage: node caveman.mjs <install|verify|uninstall|export> [--dry-run] [--only claude|codex] [--home DIR] [--live]';
+const USAGE =
+  'usage: node caveman.mjs [install|verify|uninstall|export|help] [--dry-run] [--only claude|codex] [--home DIR] [--live]\n' +
+  '       no command = install (so `npx -y caveman-portable` sets up a device in one line)';
 
 try {
   if (ONLY && !['claude', 'codex'].includes(ONLY)) throw new Error('--only must be "claude" or "codex"');
@@ -502,7 +505,7 @@ try {
     process.exitCode = verify();
   } else {
     console.log(USAGE);
-    process.exitCode = command ? 1 : 0;
+    process.exitCode = command === 'help' ? 0 : 1;
   }
 } catch (e) {
   console.error(`error: ${e.message}`);
