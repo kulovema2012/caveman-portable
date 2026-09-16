@@ -50,6 +50,7 @@ node caveman.mjs install
 | `--no-codex-notice` | skip the per-prompt notice in Codex |
 | `--only claude` / `--only codex` | limit the install to one tool |
 | `--dry-run` | show what would change |
+| `--home DIR` | treat `DIR` as the home directory instead of yours — for testing, or for setting up a different account's home |
 
 Running install again is safe. It only changes what differs from the payload, and otherwise reports "already up to date".
 
