@@ -44,9 +44,12 @@ node caveman.mjs install
 | `--scope project` | install inside one repository only; nothing in your home folder changes |
 | `--project DIR` | which repository (default: the current directory) |
 | `--shared` | project scope: write the committed `.claude/settings.json` instead of `settings.local.json` |
-| `--icon display` | default: draw the icon in front of each reply with a `MessageDisplay` hook |
-| `--icon plugin` | user scope only: use the experimental function-hook badge instead |
-| `--icon none` | no inline icon; the status line still shows the style |
+| `--statusline patch` | default: wrap your status line so it also shows `🪨 caveman`; your own command still runs |
+| `--statusline print` | print a snippet to paste into your own status-line script instead |
+| `--statusline none` | leave the status line alone |
+| `--icon display` | also draw the icon in front of each reply (a `MessageDisplay` hook) |
+| `--icon plugin` | user scope only: the experimental function-hook badge instead |
+| `--icon none` | default: no inline icon |
 | `--no-codex-notice` | skip the per-prompt notice in Codex |
 | `--only claude` / `--only codex` | limit the install to one tool |
 | `--dry-run` | show what would change |
@@ -60,7 +63,8 @@ Running install again is safe. It only changes what differs from the payload, an
 |---|---|---|
 | `~/.claude/output-styles/caveman.md` | copied | Claude main conversation and forks |
 | `~/.claude/hooks/caveman-subagent.mjs` | copied | Gives every other Claude sub-agent (general-purpose, Explore, Plan, custom) the caveman rules; output styles don't reach them |
-| `~/.claude/hooks/caveman-display.mjs` | copied with `--icon display` | Draws the icon in front of each reply, display-only |
+| `~/.claude/hooks/caveman-statusline.mjs` + `caveman-statusline.json` | copied by default (`--statusline patch`) | The wrapper runs your existing status-line command and prefixes `🪨 caveman`; the `.json` holds your original command so uninstall restores it. It never edits your script, and it skips the badge if your script already prints it |
+| `~/.claude/hooks/caveman-display.mjs` | copied only with `--icon display` | Draws the icon in front of each reply, display-only |
 | `~/.claude/settings.json` | sets `outputStyle` to `"Caveman"`; registers the hook groups; disables `explanatory-output-style` if it is enabled | Merged: every other setting and hook is left alone |
 | `~/.agents/skills/caveman/SKILL.md` | copied | Shared skill. Codex reads this folder natively |
 | `~/.claude/skills/caveman` | link to the shared skill (a junction on Windows) | Claude doesn't read `~/.agents/skills` |
@@ -92,7 +96,7 @@ This writes into the repository and nothing else:
 | `.claude/skills/caveman/SKILL.md` | the skill, as a project copy |
 | `AGENTS.md` | the caveman section, where Codex reads it for this repo |
 
-The hooks address their scripts through `${CLAUDE_PROJECT_DIR}`, so the settings file still works in another checkout or on another machine. Two notes: a personal skill of the same name wins over a project one, and the Codex prompt notice is not available per project, because Codex keeps hooks per home directory. `verify --scope project` checks this scope and reports both.
+The hooks address their scripts through `${CLAUDE_PROJECT_DIR}`, so the settings file still works in another checkout or on another machine. Three notes: a personal skill of the same name wins over a project one, the Codex prompt notice is not available per project because Codex keeps hooks per home directory, and the status-line badge is left alone in this scope since a status line belongs to the machine, not the repository. `verify --scope project` checks this scope and reports both.
 
 ## Why these layers
 
@@ -100,6 +104,7 @@ The hooks address their scripts through `${CLAUDE_PROJECT_DIR}`, so the settings
 - The **SubagentStart hook** covers every other Claude sub-agent. Those run their own system prompt, which output styles never reach.
 - **`AGENTS.md`** is loaded by every Codex agent, the main one and each spawned sub-agent.
 - The **skill** tells the main agent to also put a caveman protocol block into each sub-agent prompt. This is a second layer; the first three work without it.
+- The **status-line badge** answers "is caveman actually on?" every turn: it reads the configured style, not the wording of a reply, so it cannot flatter you.
 - The **icon** is only a display: `MessageDisplay` replaces what is drawn, never the transcript or what Claude sees.
 
 All of it was tested with no IDE environment and with every memory mechanism off (Claude auto-memory, the `remember` and `context-mode` plugins, and Codex `memories`). The main agents and sub-agents in both tools still replied in caveman.
@@ -125,7 +130,7 @@ All of it was tested with no IDE environment and with every memory mechanism off
 
 ## Uninstall
 
-`node caveman.mjs uninstall` (or with `--scope project`) removes the output style, the hooks, the settings entries, the skill link, the badge plugin and the AGENTS section, with backups. It leaves `multi_agent` alone (Codex's default anyway), does not re-enable the explanatory plugin, and does not restore the skills lock entry.
+`node caveman.mjs uninstall` (or with `--scope project`) removes the output style, the hooks, the settings entries, the skill link, the badge plugin and the AGENTS section, with backups. Your status line goes back to the command it had before, taken from the saved `caveman-statusline.json`. It leaves `multi_agent` alone (Codex's default anyway), does not re-enable the explanatory plugin, and does not restore the skills lock entry.
 
 ## Known overwrite risks
 

@@ -27,7 +27,10 @@ const optionValue = (name) => {
 
 const DRY = hasFlag('--dry-run');
 const ONLY = optionValue('--only');
-const ICON = optionValue('--icon') ?? 'display';
+// The status-line badge is the default way to show the style in Claude; the inline reply icon is opt-in.
+// Codex has no customisable status line, so its per-prompt notice stays the default there.
+const ICON = optionValue('--icon') ?? 'none';
+const STATUSLINE = optionValue('--statusline') ?? 'patch';
 const CODEX_NOTICE_WANTED = !hasFlag('--no-codex-notice');
 const HOME_OVERRIDE = optionValue('--home');
 const HOME = path.resolve(HOME_OVERRIDE ?? os.homedir());
@@ -42,6 +45,7 @@ const BACKUP_DIR = path.join(HOME, '.caveman-backups', new Date().toISOString().
 const SUBAGENT_HOOK = 'caveman-subagent.mjs';
 const DISPLAY_HOOK = 'caveman-display.mjs';
 const CODEX_NOTICE = 'caveman-notice.mjs';
+const STATUSLINE_SCRIPT = 'caveman-statusline.mjs';
 const EXPLANATORY_PLUGIN = 'explanatory-output-style@claude-plugins-official';
 const MARK_START = '<!-- caveman:start (managed by caveman-portable; edit payload/codex/AGENTS.caveman.md) -->';
 const MARK_END = '<!-- caveman:end -->';
@@ -61,8 +65,11 @@ const FILES = {
   subagent: [path.join(PAYLOAD, 'claude/hooks', SUBAGENT_HOOK), path.join(CLAUDE_DIR, 'hooks', SUBAGENT_HOOK)],
   display: [path.join(PAYLOAD, 'claude/hooks', DISPLAY_HOOK), path.join(CLAUDE_DIR, 'hooks', DISPLAY_HOOK)],
   notice: [path.join(PAYLOAD, 'codex/hooks', CODEX_NOTICE), path.join(CODEX_DIR, 'hooks', CODEX_NOTICE)],
+  statusline: [path.join(PAYLOAD, 'claude/hooks', STATUSLINE_SCRIPT), path.join(CLAUDE_DIR, 'hooks', STATUSLINE_SCRIPT)],
   skill: [path.join(PAYLOAD, 'agents/skills/caveman/SKILL.md'), path.join(SHARED_SKILL_DIR, 'SKILL.md')],
 };
+// Holds whatever status-line command was configured before, so uninstall can put it back.
+const STATUSLINE_SIDECAR = path.join(CLAUDE_DIR, 'hooks', 'caveman-statusline.json');
 const AGENTS_SECTION = path.join(PAYLOAD, 'codex/AGENTS.caveman.md');
 const SETTINGS = path.join(CLAUDE_DIR, 'settings.json');
 const CLAUDE_SKILL_LINK = path.join(CLAUDE_DIR, 'skills/caveman');
@@ -353,6 +360,8 @@ function mergeSettings() {
   else dropHookGroup(data, 'MessageDisplay', DISPLAY_HOOK);
   if (ICON === 'plugin') enablePluginInSettings(data);
   else disablePluginInSettings(data);
+  if (STATUSLINE === 'patch') patchStatusline(data);
+  else unpatchStatusline(data);
   if (data.enabledPlugins?.[EXPLANATORY_PLUGIN] === true) {
     note(`settings.json: disable ${EXPLANATORY_PLUGIN} (its Insight blocks fight caveman)`);
     data.enabledPlugins[EXPLANATORY_PLUGIN] = false;
@@ -371,7 +380,56 @@ function unmergeSettings() {
   dropHookGroup(data, 'SubagentStart', SUBAGENT_HOOK);
   dropHookGroup(data, 'MessageDisplay', DISPLAY_HOOK);
   disablePluginInSettings(data);
+  unpatchStatusline(data);
   saveSettings(data, before);
+}
+
+// ---------- status-line badge ----------
+//
+// Status-line scripts are personal, so `patch` never edits yours: it saves your command in a sidecar file and
+// points the status line at a wrapper that runs it and prefixes the badge. `print` writes a snippet instead,
+// for people who would rather edit their own script.
+
+const wrapperCommand = () => `node "${slash(FILES.statusline[1])}"`;
+
+const STATUSLINE_SNIPPET = [
+  '  // caveman badge: the status line receives output_style.name, so this re-checks on every refresh.',
+  "  const style = (d.output_style && d.output_style.name) || 'default';",
+  "  const badge = style.toLowerCase() === 'caveman' ? '\\u{1FAA8} caveman' : '\\u26A0 style: ' + style;",
+  '  // then print `badge` alongside whatever else your status line shows.',
+].join('\n');
+
+function savedStatusline() {
+  try {
+    return JSON.parse(read(STATUSLINE_SIDECAR) ?? '{}')?.command ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function patchStatusline(data) {
+  const wrapper = wrapperCommand();
+  const current = data.statusLine;
+  if (current?.command === wrapper) return;
+  if (current?.type === 'command' && typeof current.command === 'string' && current.command) {
+    writeText(STATUSLINE_SIDECAR, JSON.stringify({ command: current.command }, null, 2) + '\n', 'your status line, restored on uninstall');
+    note('settings.json: wrap the status line so it also shows the caveman badge');
+  } else {
+    note('settings.json: set a status line that shows the caveman badge');
+  }
+  data.statusLine = { ...(current ?? {}), type: 'command', command: wrapper };
+}
+
+function unpatchStatusline(data) {
+  if (data.statusLine?.command !== wrapperCommand()) return;
+  const saved = savedStatusline();
+  if (saved) {
+    note('settings.json: restore your own status line command');
+    data.statusLine = { ...data.statusLine, command: saved };
+  } else {
+    note('settings.json: remove the caveman status line');
+    delete data.statusLine;
+  }
 }
 
 // ---------- the optional function-hook badge plugin ----------
@@ -651,6 +709,7 @@ function verifyProject() {
 function requirePayload() {
   const needed = [FILES.style[0], FILES.subagent[0], FILES.skill[0], AGENTS_SECTION];
   if (ICON === 'display') needed.push(FILES.display[0]);
+  if (STATUSLINE === 'patch') needed.push(FILES.statusline[0]);
   if (ICON === 'plugin') needed.push(...PLUGIN_PARTS.map((rel) => path.join(PAYLOAD, 'plugin', rel)));
   if (CODEX_NOTICE_WANTED) needed.push(FILES.notice[0]);
   const missing = needed.filter((p) => !fs.existsSync(p));
@@ -690,8 +749,15 @@ function install() {
     else deleteFile(FILES.display[1], 'icon hook not selected');
     if (ICON === 'plugin') installPluginFiles();
     else removePluginFiles();
+    if (STATUSLINE === 'patch') writeText(FILES.statusline[1], read(FILES.statusline[0]), 'status-line wrapper: badge beside your own status line');
     ensureClaudeSkillLink();
     mergeSettings();
+    // mergeSettings restores the saved command first, so the wrapper and its sidecar go afterwards.
+    if (STATUSLINE !== 'patch') {
+      deleteFile(FILES.statusline[1], 'status-line wrapper not selected');
+      deleteFile(STATUSLINE_SIDECAR, 'saved status line no longer needed');
+    }
+    if (STATUSLINE === 'print') followUps.push(`Add the caveman badge to your own status line:\n${STATUSLINE_SNIPPET}`);
   }
   if (forCodex) {
     ensureAgentsSection();
@@ -714,6 +780,9 @@ function uninstall() {
     deleteFile(FILES.style[1], 'caveman output style');
     deleteFile(FILES.subagent[1], 'caveman SubagentStart hook');
     deleteFile(FILES.display[1], 'caveman MessageDisplay hook');
+    // unmergeSettings already put the saved command back, so these two can go now.
+    deleteFile(FILES.statusline[1], 'caveman status-line wrapper');
+    deleteFile(STATUSLINE_SIDECAR, 'saved status line');
     removePluginFiles();
   }
   if (forCodex) {
@@ -734,7 +803,7 @@ function uninstall() {
 }
 
 function exportPayload() {
-  for (const key of ['style', 'subagent', 'display', 'skill', 'notice']) {
+  for (const key of ['style', 'subagent', 'display', 'statusline', 'skill', 'notice']) {
     const [payloadCopy, installed] = FILES[key];
     const live = read(installed);
     if (live === null) {
@@ -800,6 +869,21 @@ function verifyClaude() {
     const market = Boolean(data.extraKnownMarketplaces?.[MARKETPLACE]);
     const missing = [!files && 'plugin files', !flag && `${FUNCTION_HOOKS_ENV}=1`, !market && 'marketplace entry'].filter(Boolean);
     check(missing.length ? 'FAIL' : 'ok', 'function-hook badge plugin', missing.length ? `missing ${missing.join(', ')}` : PLUGIN_ROOT);
+  }
+
+  if (data.statusLine?.command === wrapperCommand()) {
+    compareToPayload('status-line wrapper script', FILES.statusline);
+    const run = spawnSync(process.execPath, [FILES.statusline[1]], {
+      input: JSON.stringify({ cwd: HOME, model: { display_name: 'verify' } }),
+      encoding: 'utf8',
+      timeout: 10000,
+    });
+    const shown = (run.stdout ?? '').trim();
+    check(shown.includes('\u{1FAA8}') ? 'ok' : 'FAIL', 'status line draws the caveman badge', shown || String(run.error?.message ?? 'no output'));
+    const saved = savedStatusline();
+    check(saved ? 'ok' : 'warn', 'your own status line is saved for uninstall', saved ?? 'none saved: uninstall will just drop the caveman status line');
+  } else {
+    check('ok', 'status-line badge', 'not installed');
   }
 
   check(data.enabledPlugins?.[EXPLANATORY_PLUGIN] === true ? 'FAIL' : 'ok', 'explanatory-output-style plugin not enabled');
@@ -960,9 +1044,12 @@ const USAGE = [
   '  --scope project     install inside one repository only, nothing in the home directory',
   '  --project DIR       which repository (default: the current directory)',
   '  --shared            project scope: write .claude/settings.json (committed) instead of settings.local.json',
-  '  --icon display      default: draw the icon with a MessageDisplay hook',
-  '  --icon plugin       user scope only: use the experimental function-hook badge instead',
-  '  --icon none         no inline icon; the status line still shows the style',
+  '  --statusline patch  default: wrap your status line so it also shows the caveman badge',
+  '  --statusline print  print a snippet to add to your own status-line script instead',
+  '  --statusline none   leave the status line alone',
+  '  --icon display      also draw the icon in front of each reply (a MessageDisplay hook)',
+  '  --icon plugin       user scope only: the experimental function-hook badge instead',
+  '  --icon none         default: no inline icon',
   '  --no-codex-notice   skip the per-prompt notice in Codex',
   '  --only claude|codex limit the install to one tool',
   '  --dry-run           show what would change',
@@ -973,6 +1060,7 @@ const USAGE = [
 try {
   if (ONLY && !['claude', 'codex'].includes(ONLY)) throw new Error('--only must be "claude" or "codex"');
   if (!['display', 'plugin', 'none'].includes(ICON)) throw new Error('--icon must be "display", "plugin" or "none"');
+  if (!['patch', 'print', 'none'].includes(STATUSLINE)) throw new Error('--statusline must be "patch", "print" or "none"');
   if (!['user', 'project'].includes(SCOPE)) throw new Error('--scope must be "user" or "project"');
   const project = SCOPE === 'project';
   if (project && ICON === 'plugin') throw new Error('--icon plugin is user scope only: a plugin loads from the home directory, not from a project');
