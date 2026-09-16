@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // caveman-portable: makes Claude Code and Codex reply in caveman style, main agent and sub-agents alike.
 //
-//   node caveman.mjs install   [--dry-run] [--only claude|codex] [--home DIR]
+//   node caveman.mjs install   [--dry-run] [--only claude|codex] [--icon display|plugin|none] [--no-codex-notice] [--home DIR]
 //   node caveman.mjs verify    [--only claude|codex] [--home DIR] [--live]
 //   node caveman.mjs uninstall [--dry-run] [--only claude|codex] [--home DIR]
 //   node caveman.mjs export    refresh payload/ from this device's live files
@@ -27,6 +27,8 @@ const optionValue = (name) => {
 
 const DRY = hasFlag('--dry-run');
 const ONLY = optionValue('--only');
+const ICON = optionValue('--icon') ?? 'display';
+const CODEX_NOTICE_WANTED = !hasFlag('--no-codex-notice');
 const HOME_OVERRIDE = optionValue('--home');
 const HOME = path.resolve(HOME_OVERRIDE ?? os.homedir());
 // Claude Code honours CLAUDE_CONFIG_DIR. CODEX_HOME is ignored on purpose: IDEs such as Orca point it at a
@@ -37,22 +39,35 @@ const CODEX_DIR = path.join(HOME, '.codex');
 const SHARED_SKILL_DIR = path.join(HOME, '.agents', 'skills', 'caveman');
 const BACKUP_DIR = path.join(HOME, '.caveman-backups', new Date().toISOString().replace(/[:.]/g, '-'));
 
-const HOOK_NAME = 'caveman-subagent.mjs';
+const SUBAGENT_HOOK = 'caveman-subagent.mjs';
+const DISPLAY_HOOK = 'caveman-display.mjs';
+const CODEX_NOTICE = 'caveman-notice.mjs';
 const EXPLANATORY_PLUGIN = 'explanatory-output-style@claude-plugins-official';
 const MARK_START = '<!-- caveman:start (managed by caveman-portable; edit payload/codex/AGENTS.caveman.md) -->';
 const MARK_END = '<!-- caveman:end -->';
 const LEGACY_HEADING = '# Response style — caveman';
 
+// The optional function-hook badge: a local marketplace holding one plugin, so Claude Code can load it
+// without a per-launch --plugin-dir flag.
+const PLUGIN_ROOT = path.join(HOME, '.caveman-badge');
+const MARKETPLACE = 'caveman';
+const PLUGIN_ID = `caveman-badge@${MARKETPLACE}`;
+const FUNCTION_HOOKS_ENV = 'CLAUDE_CODE_ENABLE_FUNCTION_HOOKS';
+const PLUGIN_PARTS = ['caveman-badge/.claude-plugin/plugin.json', 'caveman-badge/hooks/hooks.json', 'caveman-badge/hooks/badge.js'];
+
 // [payload copy, installed location]
 const FILES = {
   style: [path.join(PAYLOAD, 'claude/output-styles/caveman.md'), path.join(CLAUDE_DIR, 'output-styles/caveman.md')],
-  hook: [path.join(PAYLOAD, 'claude/hooks', HOOK_NAME), path.join(CLAUDE_DIR, 'hooks', HOOK_NAME)],
+  subagent: [path.join(PAYLOAD, 'claude/hooks', SUBAGENT_HOOK), path.join(CLAUDE_DIR, 'hooks', SUBAGENT_HOOK)],
+  display: [path.join(PAYLOAD, 'claude/hooks', DISPLAY_HOOK), path.join(CLAUDE_DIR, 'hooks', DISPLAY_HOOK)],
+  notice: [path.join(PAYLOAD, 'codex/hooks', CODEX_NOTICE), path.join(CODEX_DIR, 'hooks', CODEX_NOTICE)],
   skill: [path.join(PAYLOAD, 'agents/skills/caveman/SKILL.md'), path.join(SHARED_SKILL_DIR, 'SKILL.md')],
 };
 const AGENTS_SECTION = path.join(PAYLOAD, 'codex/AGENTS.caveman.md');
 const SETTINGS = path.join(CLAUDE_DIR, 'settings.json');
 const CLAUDE_SKILL_LINK = path.join(CLAUDE_DIR, 'skills/caveman');
 const CODEX_SKILL_COPY = path.join(CODEX_DIR, 'skills/caveman');
+const CODEX_HOOKS = path.join(CODEX_DIR, 'hooks.json');
 const AGENTS_MD = path.join(CODEX_DIR, 'AGENTS.md');
 const CODEX_CONFIG = path.join(CODEX_DIR, 'config.toml');
 
@@ -60,6 +75,7 @@ const forClaude = ONLY !== 'codex';
 const forCodex = ONLY !== 'claude';
 const actions = [];
 const results = [];
+const followUps = [];
 let backedUp = false;
 
 // ---------- file helpers ----------
@@ -142,6 +158,16 @@ function removeLink(p) {
   }
 }
 
+// Runs one hook script the way its host would, and returns the parsed JSON it printed.
+function runHook(cmd, args, input) {
+  const run = spawnSync(cmd, args, { input, encoding: 'utf8', timeout: 10000 });
+  try {
+    return { ok: true, json: JSON.parse(run.stdout) };
+  } catch {
+    return { ok: false, detail: String(run.error?.message ?? run.stderr ?? run.stdout ?? 'unexpected output').trim() };
+  }
+}
+
 // ---------- Codex AGENTS.md section ----------
 
 function locateSection(text) {
@@ -214,9 +240,62 @@ function withMultiAgent(text) {
   return lines.join(eol);
 }
 
+// ---------- Codex hooks.json (the per-prompt notice) ----------
+
+const mentionsNotice = (hook) => String(hook?.command ?? '').includes(CODEX_NOTICE);
+
+function loadCodexHooks() {
+  const raw = read(CODEX_HOOKS);
+  if (raw === null) return { raw, data: {} };
+  try {
+    return { raw, data: JSON.parse(raw) };
+  } catch (e) {
+    throw new Error(`${CODEX_HOOKS} is not valid JSON (${e.message}). Fix it first; nothing was changed.`);
+  }
+}
+
+function ensureCodexNotice() {
+  writeText(FILES.notice[1], read(FILES.notice[0]), 'Codex prompt notice: shows the icon each turn');
+  const { data } = loadCodexHooks();
+  const before = actions.length;
+  // Codex runs these through a shell, so the path is quoted rather than passed as argv.
+  const entry = { type: 'command', command: `node "${slash(FILES.notice[1])}"`, timeout: 5 };
+  data.hooks ??= {};
+  data.hooks.UserPromptSubmit ??= [];
+  const current = data.hooks.UserPromptSubmit.flatMap((g) => g.hooks ?? []).find(mentionsNotice);
+  if (!current) {
+    note('codex hooks.json: add caveman UserPromptSubmit notice');
+    data.hooks.UserPromptSubmit.push({ hooks: [entry] });
+  } else if (current.command !== entry.command) {
+    note("codex hooks.json: point the caveman notice at this device's path");
+    Object.assign(current, entry);
+  }
+  if (actions.length !== before) {
+    writeText(CODEX_HOOKS, JSON.stringify(data, null, 2) + '\n');
+    followUps.push('Codex runs a new hook only after you approve it: open `codex`, review the hook it reports, and trust it.');
+  }
+}
+
+function removeCodexNotice() {
+  const { raw, data } = loadCodexHooks();
+  if (raw !== null) {
+    const groups = data.hooks?.UserPromptSubmit;
+    if (Array.isArray(groups) && groups.some((g) => (g.hooks ?? []).some(mentionsNotice))) {
+      note('codex hooks.json: remove caveman UserPromptSubmit notice');
+      const kept = groups.map((g) => ({ ...g, hooks: (g.hooks ?? []).filter((h) => !mentionsNotice(h)) })).filter((g) => g.hooks.length);
+      if (kept.length) data.hooks.UserPromptSubmit = kept;
+      else delete data.hooks.UserPromptSubmit;
+      if (!Object.keys(data.hooks).length) delete data.hooks;
+      if (Object.keys(data).length) writeText(CODEX_HOOKS, JSON.stringify(data, null, 2) + '\n');
+      else deleteFile(CODEX_HOOKS, 'it only held the caveman notice');
+    }
+  }
+  deleteFile(FILES.notice[1], 'Codex prompt notice');
+}
+
 // ---------- Claude settings.json ----------
 
-const isCavemanHook = (h) => [h?.command, ...(h?.args ?? [])].some((x) => typeof x === 'string' && x.includes(HOOK_NAME));
+const hookUses = (hook, file) => [hook?.command, ...(hook?.args ?? [])].some((x) => typeof x === 'string' && x.includes(file));
 
 function loadSettings() {
   const raw = read(SETTINGS);
@@ -230,7 +309,36 @@ function loadSettings() {
 
 function saveSettings(data, actionsBefore) {
   if (actions.length === actionsBefore) return;
-  writeText(SETTINGS, JSON.stringify(data, null, 2) + '\n');
+  // After an uninstall the file can end up holding nothing; leave no empty shell behind.
+  if (!Object.keys(data).length) deleteFile(SETTINGS, 'it only held the caveman settings');
+  else writeText(SETTINGS, JSON.stringify(data, null, 2) + '\n');
+}
+
+// Exec form with this device's node binary: no shell, no PATH lookup at hook time.
+const execHook = (script) => ({ type: 'command', command: slash(process.execPath), args: [slash(script)], timeout: 10 });
+
+function ensureHookGroup(data, event, script, label) {
+  data.hooks ??= {};
+  data.hooks[event] ??= [];
+  const wanted = execHook(script);
+  const current = data.hooks[event].flatMap((g) => g.hooks ?? []).find((h) => hookUses(h, path.basename(script)));
+  if (!current) {
+    note(`settings.json: add caveman ${event} hook (${label})`);
+    data.hooks[event].unshift({ hooks: [wanted] });
+  } else if (current.command !== wanted.command || JSON.stringify(current.args) !== JSON.stringify(wanted.args)) {
+    note(`settings.json: point the caveman ${event} hook at this device's node and home`);
+    Object.assign(current, wanted);
+  }
+}
+
+function dropHookGroup(data, event, file) {
+  const groups = data.hooks?.[event];
+  if (!Array.isArray(groups) || !groups.some((g) => (g.hooks ?? []).some((h) => hookUses(h, file)))) return;
+  note(`settings.json: remove caveman ${event} hook`);
+  const kept = groups.map((g) => ({ ...g, hooks: (g.hooks ?? []).filter((h) => !hookUses(h, file)) })).filter((g) => g.hooks.length);
+  if (kept.length) data.hooks[event] = kept;
+  else delete data.hooks[event];
+  if (data.hooks && !Object.keys(data.hooks).length) delete data.hooks;
 }
 
 function mergeSettings() {
@@ -240,18 +348,11 @@ function mergeSettings() {
     note(`settings.json: outputStyle ${JSON.stringify(data.outputStyle ?? null)} -> "Caveman"`);
     data.outputStyle = 'Caveman';
   }
-  // Exec form with this device's node binary: no shell, no PATH lookup at hook time.
-  const hook = { type: 'command', command: slash(process.execPath), args: [slash(FILES.hook[1])], timeout: 10 };
-  data.hooks ??= {};
-  data.hooks.SubagentStart ??= [];
-  const current = data.hooks.SubagentStart.flatMap((g) => g.hooks ?? []).find(isCavemanHook);
-  if (!current) {
-    note('settings.json: add caveman SubagentStart hook');
-    data.hooks.SubagentStart.unshift({ hooks: [hook] });
-  } else if (current.command !== hook.command || JSON.stringify(current.args) !== JSON.stringify(hook.args)) {
-    note("settings.json: point caveman SubagentStart hook at this device's node and home");
-    Object.assign(current, hook);
-  }
+  ensureHookGroup(data, 'SubagentStart', FILES.subagent[1], 'rules for every sub-agent');
+  if (ICON === 'display') ensureHookGroup(data, 'MessageDisplay', FILES.display[1], 'icon in front of each reply');
+  else dropHookGroup(data, 'MessageDisplay', DISPLAY_HOOK);
+  if (ICON === 'plugin') enablePluginInSettings(data);
+  else disablePluginInSettings(data);
   if (data.enabledPlugins?.[EXPLANATORY_PLUGIN] === true) {
     note(`settings.json: disable ${EXPLANATORY_PLUGIN} (its Insight blocks fight caveman)`);
     data.enabledPlugins[EXPLANATORY_PLUGIN] = false;
@@ -267,17 +368,88 @@ function unmergeSettings() {
     note('settings.json: remove outputStyle "Caveman"');
     delete data.outputStyle;
   }
-  const groups = data.hooks?.SubagentStart;
-  if (Array.isArray(groups) && groups.some((g) => (g.hooks ?? []).some(isCavemanHook))) {
-    note('settings.json: remove caveman SubagentStart hook');
-    const kept = groups
-      .map((g) => ({ ...g, hooks: (g.hooks ?? []).filter((h) => !isCavemanHook(h)) }))
-      .filter((g) => g.hooks.length);
-    if (kept.length) data.hooks.SubagentStart = kept;
-    else delete data.hooks.SubagentStart;
-    if (!Object.keys(data.hooks).length) delete data.hooks;
-  }
+  dropHookGroup(data, 'SubagentStart', SUBAGENT_HOOK);
+  dropHookGroup(data, 'MessageDisplay', DISPLAY_HOOK);
+  disablePluginInSettings(data);
   saveSettings(data, before);
+}
+
+// ---------- the optional function-hook badge plugin ----------
+
+function marketplaceManifest() {
+  return (
+    JSON.stringify(
+      {
+        name: MARKETPLACE,
+        owner: { name: 'caveman-portable' },
+        plugins: [
+          {
+            name: 'caveman-badge',
+            source: './caveman-badge',
+            description: 'Draws the caveman icon on each assistant message through a function hook.',
+          },
+        ],
+      },
+      null,
+      2,
+    ) + '\n'
+  );
+}
+
+function enablePluginInSettings(data) {
+  const source = { source: 'directory', path: slash(PLUGIN_ROOT) };
+  data.extraKnownMarketplaces ??= {};
+  if (JSON.stringify(data.extraKnownMarketplaces[MARKETPLACE]?.source) !== JSON.stringify(source)) {
+    note(`settings.json: register the local "${MARKETPLACE}" marketplace`);
+    data.extraKnownMarketplaces[MARKETPLACE] = { source };
+  }
+  data.enabledPlugins ??= {};
+  if (data.enabledPlugins[PLUGIN_ID] !== true) {
+    note(`settings.json: enable ${PLUGIN_ID}`);
+    data.enabledPlugins[PLUGIN_ID] = true;
+  }
+  data.env ??= {};
+  if (data.env[FUNCTION_HOOKS_ENV] !== '1') {
+    note(`settings.json: set ${FUNCTION_HOOKS_ENV}=1 (function hooks are off by default)`);
+    data.env[FUNCTION_HOOKS_ENV] = '1';
+  }
+}
+
+function disablePluginInSettings(data) {
+  if (data.extraKnownMarketplaces?.[MARKETPLACE]) {
+    note(`settings.json: unregister the local "${MARKETPLACE}" marketplace`);
+    delete data.extraKnownMarketplaces[MARKETPLACE];
+    if (!Object.keys(data.extraKnownMarketplaces).length) delete data.extraKnownMarketplaces;
+  }
+  if (data.enabledPlugins?.[PLUGIN_ID] !== undefined) {
+    note(`settings.json: drop ${PLUGIN_ID}`);
+    delete data.enabledPlugins[PLUGIN_ID];
+    if (!Object.keys(data.enabledPlugins).length) delete data.enabledPlugins;
+  }
+  if (data.env?.[FUNCTION_HOOKS_ENV] !== undefined) {
+    note(`settings.json: drop ${FUNCTION_HOOKS_ENV}`);
+    delete data.env[FUNCTION_HOOKS_ENV];
+    if (!Object.keys(data.env).length) delete data.env;
+  }
+}
+
+function installPluginFiles() {
+  for (const rel of PLUGIN_PARTS) writeText(path.join(PLUGIN_ROOT, rel), read(path.join(PAYLOAD, 'plugin', rel)), 'function-hook badge');
+  writeText(path.join(PLUGIN_ROOT, '.claude-plugin/marketplace.json'), marketplaceManifest(), 'local marketplace holding the badge');
+  followUps.push('The badge plugin uses an experimental flag; if a reply ever shows two icons, one of the two mechanisms is still active.');
+}
+
+function removePluginFiles() {
+  for (const rel of [...PLUGIN_PARTS, '.claude-plugin/marketplace.json']) deleteFile(path.join(PLUGIN_ROOT, rel), 'function-hook badge');
+  if (DRY) return;
+  // Remove the folders the plugin owned, deepest first, and only while they are empty.
+  for (const rel of ['caveman-badge/hooks', 'caveman-badge/.claude-plugin', 'caveman-badge', '.claude-plugin', '']) {
+    try {
+      fs.rmdirSync(path.join(PLUGIN_ROOT, rel));
+    } catch {
+      // not empty or already gone
+    }
+  }
 }
 
 // ---------- skill links ----------
@@ -299,10 +471,189 @@ function ensureClaudeSkillLink() {
   fs.symlinkSync(SHARED_SKILL_DIR, CLAUDE_SKILL_LINK, process.platform === 'win32' ? 'junction' : 'dir');
 }
 
+// ---------- project scope ----------
+//
+// A project install keeps everything inside one repository: the style, the hooks and a copy of the skill live
+// under <project>/.claude, and Codex reads the caveman section from the project's own AGENTS.md. Nothing in the
+// home directory is touched, so other projects keep whatever style they had.
+
+const SCOPE = optionValue('--scope') ?? 'user';
+const PROJECT_DIR = path.resolve(optionValue('--project') ?? process.cwd());
+const PROJECT_CLAUDE = path.join(PROJECT_DIR, '.claude');
+// settings.local.json is the personal, git-ignored file; --shared writes the committed settings.json instead.
+const PROJECT_SETTINGS = path.join(PROJECT_CLAUDE, hasFlag('--shared') ? 'settings.json' : 'settings.local.json');
+const PROJECT_AGENTS = path.join(PROJECT_DIR, 'AGENTS.md');
+const PROJECT_FILES = {
+  style: [FILES.style[0], path.join(PROJECT_CLAUDE, 'output-styles/caveman.md')],
+  subagent: [FILES.subagent[0], path.join(PROJECT_CLAUDE, 'hooks', SUBAGENT_HOOK)],
+  display: [FILES.display[0], path.join(PROJECT_CLAUDE, 'hooks', DISPLAY_HOOK)],
+  skill: [FILES.skill[0], path.join(PROJECT_CLAUDE, 'skills/caveman/SKILL.md')],
+};
+
+// Project hooks address their scripts through ${CLAUDE_PROJECT_DIR}, so the settings file survives a different
+// checkout path or machine. Exec form substitutes the placeholder without a shell, so it needs no quoting.
+const projectHook = (file) => ({ type: 'command', command: 'node', args: [`\${CLAUDE_PROJECT_DIR}/.claude/hooks/${file}`], timeout: 10 });
+
+function requireProjectPayload() {
+  const needed = [PROJECT_FILES.style[0], PROJECT_FILES.subagent[0], PROJECT_FILES.skill[0], AGENTS_SECTION];
+  if (ICON === 'display') needed.push(PROJECT_FILES.display[0]);
+  const missing = needed.filter((p) => !fs.existsSync(p));
+  if (missing.length) throw new Error(`payload incomplete, missing:\n  ${missing.join('\n  ')}`);
+}
+
+function readProjectSettings() {
+  const raw = read(PROJECT_SETTINGS);
+  if (raw === null) return {};
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`${PROJECT_SETTINGS} is not valid JSON (${e.message}). Fix it first; nothing was changed.`);
+  }
+}
+
+function ensureProjectHook(data, event, file, label) {
+  data.hooks ??= {};
+  data.hooks[event] ??= [];
+  const wanted = projectHook(file);
+  const current = data.hooks[event].flatMap((g) => g.hooks ?? []).find((h) => hookUses(h, file));
+  if (!current) {
+    note(`${path.basename(PROJECT_SETTINGS)}: add caveman ${event} hook (${label})`);
+    data.hooks[event].unshift({ hooks: [wanted] });
+  } else if (JSON.stringify(current.args) !== JSON.stringify(wanted.args)) {
+    note(`${path.basename(PROJECT_SETTINGS)}: repoint the caveman ${event} hook`);
+    Object.assign(current, wanted);
+  }
+}
+
+function ensureProjectAgentsSection() {
+  const block = `${MARK_START}\n${read(AGENTS_SECTION).trim()}\n${MARK_END}`;
+  const text = read(PROJECT_AGENTS) ?? '';
+  const loc = locateSection(text);
+  const next = loc ? joinBlocks(text.slice(0, loc.start), block, text.slice(loc.end)) : joinBlocks(block, text);
+  writeText(PROJECT_AGENTS, next, 'caveman section in the project AGENTS.md, where Codex reads it');
+}
+
+function installProject() {
+  requireProjectPayload();
+  const data = readProjectSettings();
+  const before = actions.length;
+  if (forClaude) {
+    writeText(PROJECT_FILES.style[1], read(PROJECT_FILES.style[0]), 'output style for this project');
+    writeText(PROJECT_FILES.skill[1], read(PROJECT_FILES.skill[0]), 'project copy of the caveman skill');
+    writeText(PROJECT_FILES.subagent[1], read(PROJECT_FILES.subagent[0]), 'SubagentStart hook for this project');
+    if (data.outputStyle !== 'Caveman') {
+      note(`${path.basename(PROJECT_SETTINGS)}: outputStyle ${JSON.stringify(data.outputStyle ?? null)} -> "Caveman"`);
+      data.outputStyle = 'Caveman';
+    }
+    ensureProjectHook(data, 'SubagentStart', SUBAGENT_HOOK, 'rules for every sub-agent');
+    if (ICON === 'display') {
+      writeText(PROJECT_FILES.display[1], read(PROJECT_FILES.display[0]), 'MessageDisplay hook: icon per reply');
+      ensureProjectHook(data, 'MessageDisplay', DISPLAY_HOOK, 'icon in front of each reply');
+    } else {
+      deleteFile(PROJECT_FILES.display[1], 'icon hook not selected');
+      dropHookGroup(data, 'MessageDisplay', DISPLAY_HOOK);
+    }
+    if (actions.length !== before) writeText(PROJECT_SETTINGS, JSON.stringify(data, null, 2) + '\n');
+    if (read(path.join(HOME, '.agents', 'skills', 'caveman', 'SKILL.md')) !== null) {
+      followUps.push('A caveman skill also exists in your home directory, and a personal skill wins over a project one with the same name.');
+    }
+  }
+  if (forCodex) ensureProjectAgentsSection();
+  followUps.push(`Everything landed inside ${PROJECT_DIR}; no file in your home directory changed.`);
+  if (!hasFlag('--shared')) followUps.push(`${path.basename(PROJECT_SETTINGS)} is the personal file — add it to .gitignore if the repo does not ignore it already.`);
+}
+
+function uninstallProject() {
+  if (forClaude) {
+    const data = readProjectSettings();
+    const before = actions.length;
+    if (data.outputStyle === 'Caveman') {
+      note(`${path.basename(PROJECT_SETTINGS)}: remove outputStyle "Caveman"`);
+      delete data.outputStyle;
+    }
+    dropHookGroup(data, 'SubagentStart', SUBAGENT_HOOK);
+    dropHookGroup(data, 'MessageDisplay', DISPLAY_HOOK);
+    if (actions.length !== before) {
+      if (Object.keys(data).length) writeText(PROJECT_SETTINGS, JSON.stringify(data, null, 2) + '\n');
+      else deleteFile(PROJECT_SETTINGS, 'it only held the caveman settings');
+    }
+    for (const key of ['style', 'subagent', 'display', 'skill']) deleteFile(PROJECT_FILES[key][1], 'project caveman file');
+    if (!DRY) {
+      for (const rel of ['skills/caveman', 'skills', 'hooks', 'output-styles', '']) {
+        try {
+          fs.rmdirSync(path.join(PROJECT_CLAUDE, rel));
+        } catch {
+          // still holds other project files; leave it
+        }
+      }
+    }
+  }
+  if (forCodex) {
+    const text = read(PROJECT_AGENTS);
+    const loc = text && locateSection(text);
+    if (loc) {
+      const rest = joinBlocks(text.slice(0, loc.start), text.slice(loc.end));
+      if (rest) writeText(PROJECT_AGENTS, rest, 'remove caveman section');
+      else deleteFile(PROJECT_AGENTS, 'it only held the caveman section');
+    }
+  }
+}
+
+function verifyProject() {
+  requireProjectPayload();
+  let data;
+  try {
+    data = readProjectSettings();
+  } catch (e) {
+    check('FAIL', 'project settings', e.message);
+    data = {};
+  }
+  if (forClaude) {
+    compareToPayload('project output style file', PROJECT_FILES.style);
+    compareToPayload('project caveman skill', PROJECT_FILES.skill);
+    compareToPayload('project SubagentStart hook script', PROJECT_FILES.subagent);
+    check(data.outputStyle === 'Caveman' ? 'ok' : 'FAIL', 'outputStyle is "Caveman"', `${PROJECT_SETTINGS}: ${JSON.stringify(data.outputStyle ?? null)}`);
+    for (const [event, file, script] of [
+      ['SubagentStart', SUBAGENT_HOOK, PROJECT_FILES.subagent[1]],
+      ['MessageDisplay', DISPLAY_HOOK, PROJECT_FILES.display[1]],
+    ]) {
+      const registered = (data.hooks?.[event] ?? []).flatMap((g) => g.hooks ?? []).some((h) => hookUses(h, file));
+      if (!registered) {
+        check(event === 'MessageDisplay' ? 'ok' : 'FAIL', `${event} hook registered`, event === 'MessageDisplay' ? 'icon not selected for this project' : 'missing');
+        continue;
+      }
+      const input = event === 'SubagentStart' ? '{"hook_event_name":"SubagentStart"}' : JSON.stringify({ index: 0, delta: 'x', cwd: PROJECT_DIR });
+      const r = runHook(process.execPath, [script], input);
+      const out = r.ok ? r.json.hookSpecificOutput : null;
+      const good = event === 'SubagentStart' ? /caveman/i.test(out?.additionalContext ?? '') : String(out?.displayContent ?? '').includes('\u{1FAA8}');
+      check(good ? 'ok' : 'FAIL', `${event} hook runs from the project`, good ? script : r.detail ?? 'unexpected output');
+    }
+    const personal = read(path.join(HOME, '.agents', 'skills', 'caveman', 'SKILL.md'));
+    check(personal === null ? 'ok' : 'warn', 'no personal caveman skill shadowing this one', personal === null ? '' : 'a personal skill wins over a project skill of the same name');
+  }
+  if (forCodex) {
+    const text = read(PROJECT_AGENTS);
+    const loc = text && locateSection(text);
+    const same = loc && sectionBody(text, loc) === read(AGENTS_SECTION).trim() + '\n';
+    check(loc && same ? 'ok' : loc ? 'warn' : 'FAIL', 'project AGENTS.md caveman section', loc ? (same ? PROJECT_AGENTS : 'differs from payload') : `missing in ${PROJECT_AGENTS}`);
+    check('ok', 'Codex prompt notice', 'skipped: Codex hooks are per home directory, not per project');
+  }
+  const width = Math.max(...results.map((r) => r.label.length));
+  for (const r of results) console.log(`${`[${r.level}]`.padEnd(7)} ${r.label.padEnd(width)}  ${r.detail}`);
+  const fails = results.filter((r) => r.level === 'FAIL').length;
+  const warns = results.filter((r) => r.level === 'warn').length;
+  console.log(`\n${fails ? `${fails} check(s) failed` : 'all required checks passed'}${warns ? `, ${warns} warning(s)` : ''}.`);
+  return fails ? 1 : 0;
+}
+
 // ---------- commands ----------
 
 function requirePayload() {
-  const missing = [FILES.style[0], FILES.hook[0], FILES.skill[0], AGENTS_SECTION].filter((p) => !fs.existsSync(p));
+  const needed = [FILES.style[0], FILES.subagent[0], FILES.skill[0], AGENTS_SECTION];
+  if (ICON === 'display') needed.push(FILES.display[0]);
+  if (ICON === 'plugin') needed.push(...PLUGIN_PARTS.map((rel) => path.join(PAYLOAD, 'plugin', rel)));
+  if (CODEX_NOTICE_WANTED) needed.push(FILES.notice[0]);
+  const missing = needed.filter((p) => !fs.existsSync(p));
   if (missing.length) {
     throw new Error(
       `payload incomplete, missing:\n  ${missing.join('\n  ')}\nRun "node caveman.mjs export" on a device that already has the setup.`,
@@ -334,13 +685,19 @@ function install() {
   dropSkillLockEntry();
   if (forClaude) {
     writeText(FILES.style[1], read(FILES.style[0]), 'output style: main conversation and forks');
-    writeText(FILES.hook[1], read(FILES.hook[0]), 'SubagentStart hook: every other sub-agent');
+    writeText(FILES.subagent[1], read(FILES.subagent[0]), 'SubagentStart hook: every other sub-agent');
+    if (ICON === 'display') writeText(FILES.display[1], read(FILES.display[0]), 'MessageDisplay hook: icon per reply');
+    else deleteFile(FILES.display[1], 'icon hook not selected');
+    if (ICON === 'plugin') installPluginFiles();
+    else removePluginFiles();
     ensureClaudeSkillLink();
     mergeSettings();
   }
   if (forCodex) {
     ensureAgentsSection();
     writeText(CODEX_CONFIG, withMultiAgent(read(CODEX_CONFIG) ?? ''), 'multi_agent: on by default since 0.147, pinned');
+    if (CODEX_NOTICE_WANTED) ensureCodexNotice();
+    else removeCodexNotice();
     if (exists(CODEX_SKILL_COPY) && !isLink(CODEX_SKILL_COPY)) {
       moveToBackup(CODEX_SKILL_COPY, 'Codex already reads the shared copy; two copies would both load');
     }
@@ -355,9 +712,14 @@ function uninstall() {
       if (!DRY) removeLink(CLAUDE_SKILL_LINK);
     }
     deleteFile(FILES.style[1], 'caveman output style');
-    deleteFile(FILES.hook[1], 'caveman SubagentStart hook');
+    deleteFile(FILES.subagent[1], 'caveman SubagentStart hook');
+    deleteFile(FILES.display[1], 'caveman MessageDisplay hook');
+    removePluginFiles();
   }
-  if (forCodex) removeAgentsSection();
+  if (forCodex) {
+    removeAgentsSection();
+    removeCodexNotice();
+  }
   // The shared skill serves both tools, so it only goes on a full uninstall, and only if it is still ours.
   if (forClaude && forCodex && read(FILES.skill[1]) !== null && read(FILES.skill[1]) === read(FILES.skill[0])) {
     deleteFile(FILES.skill[1], 'shared caveman skill');
@@ -372,9 +734,13 @@ function uninstall() {
 }
 
 function exportPayload() {
-  for (const [payloadCopy, installed] of [FILES.style, FILES.hook, FILES.skill]) {
+  for (const key of ['style', 'subagent', 'display', 'skill', 'notice']) {
+    const [payloadCopy, installed] = FILES[key];
     const live = read(installed);
-    if (live === null) throw new Error(`cannot export: ${installed} is missing on this device`);
+    if (live === null) {
+      console.warn(`note: ${installed} is missing on this device; kept the payload copy`);
+      continue;
+    }
     writeText(payloadCopy, live, 'from this device');
   }
   const text = read(AGENTS_MD);
@@ -398,7 +764,7 @@ function compareToPayload(label, [payloadCopy, installed]) {
 
 function verifyClaude() {
   compareToPayload('Claude output style file', FILES.style);
-  compareToPayload('Claude SubagentStart hook script', FILES.hook);
+  compareToPayload('Claude SubagentStart hook script', FILES.subagent);
   let data;
   try {
     data = loadSettings().data;
@@ -406,25 +772,36 @@ function verifyClaude() {
     return check('FAIL', 'Claude settings.json', e.message);
   }
   check(data.outputStyle === 'Caveman' ? 'ok' : 'FAIL', 'outputStyle is "Caveman"', `found ${JSON.stringify(data.outputStyle ?? null)}`);
-  const hook = (data.hooks?.SubagentStart ?? []).flatMap((g) => g.hooks ?? []).find(isCavemanHook);
-  if (!hook) {
+
+  const subagent = (data.hooks?.SubagentStart ?? []).flatMap((g) => g.hooks ?? []).find((h) => hookUses(h, SUBAGENT_HOOK));
+  if (!subagent) {
     check('FAIL', 'SubagentStart hook registered', `not found in ${SETTINGS}`);
   } else {
-    const run = spawnSync(hook.command, hook.args ?? [], {
-      input: '{"hook_event_name":"SubagentStart"}',
-      encoding: 'utf8',
-      timeout: 10000,
-    });
-    let ok = false;
-    try {
-      const out = JSON.parse(run.stdout).hookSpecificOutput;
-      ok = out?.hookEventName === 'SubagentStart' && /caveman/i.test(out?.additionalContext ?? '');
-    } catch {
-      // not JSON: reported below
-    }
-    const detail = ok ? `${hook.command} ${(hook.args ?? []).join(' ')}` : String(run.error?.message ?? run.stderr ?? 'unexpected output').trim();
-    check(ok ? 'ok' : 'FAIL', 'SubagentStart hook runs and returns caveman context', detail);
+    const r = runHook(subagent.command, subagent.args ?? [], '{"hook_event_name":"SubagentStart"}');
+    const out = r.ok ? r.json.hookSpecificOutput : null;
+    const good = out?.hookEventName === 'SubagentStart' && /caveman/i.test(out?.additionalContext ?? '');
+    check(good ? 'ok' : 'FAIL', 'SubagentStart hook returns caveman rules', good ? `${subagent.command} ${(subagent.args ?? []).join(' ')}` : r.detail ?? 'unexpected output');
   }
+
+  const display = (data.hooks?.MessageDisplay ?? []).flatMap((g) => g.hooks ?? []).find((h) => hookUses(h, DISPLAY_HOOK));
+  if (display) {
+    compareToPayload('Claude MessageDisplay hook script', FILES.display);
+    const r = runHook(display.command, display.args ?? [], JSON.stringify({ index: 0, delta: 'x', cwd: HOME }));
+    const drawn = r.ok ? r.json.hookSpecificOutput?.displayContent : null;
+    const good = typeof drawn === 'string' && drawn.includes('\u{1FAA8}');
+    check(good ? 'ok' : 'FAIL', 'reply icon hook draws the badge', good ? drawn.trim() : r.detail ?? 'no displayContent');
+  } else {
+    check('ok', 'reply icon hook', 'not installed (status line still shows the style)');
+  }
+
+  if (data.enabledPlugins?.[PLUGIN_ID] === true) {
+    const files = PLUGIN_PARTS.every((rel) => fs.existsSync(path.join(PLUGIN_ROOT, rel)));
+    const flag = data.env?.[FUNCTION_HOOKS_ENV] === '1';
+    const market = Boolean(data.extraKnownMarketplaces?.[MARKETPLACE]);
+    const missing = [!files && 'plugin files', !flag && `${FUNCTION_HOOKS_ENV}=1`, !market && 'marketplace entry'].filter(Boolean);
+    check(missing.length ? 'FAIL' : 'ok', 'function-hook badge plugin', missing.length ? `missing ${missing.join(', ')}` : PLUGIN_ROOT);
+  }
+
   check(data.enabledPlugins?.[EXPLANATORY_PLUGIN] === true ? 'FAIL' : 'ok', 'explanatory-output-style plugin not enabled');
   const linked = realpath(CLAUDE_SKILL_LINK) !== null && realpath(CLAUDE_SKILL_LINK) === realpath(SHARED_SKILL_DIR);
   check(linked ? 'ok' : 'warn', 'Claude sees the shared caveman skill', linked ? CLAUDE_SKILL_LINK : `${CLAUDE_SKILL_LINK} is not a link to ${SHARED_SKILL_DIR}`);
@@ -446,6 +823,25 @@ function verifyCodex() {
     'Codex sub-agents (multi_agent) not disabled',
     /^\s*multi_agent\s*=\s*true\b/m.test(cfg) ? 'pinned true' : 'default (on since 0.147)',
   );
+
+  let codexHooks = {};
+  try {
+    codexHooks = loadCodexHooks().data;
+  } catch (e) {
+    check('FAIL', 'Codex hooks.json', e.message);
+  }
+  const notice = (codexHooks.hooks?.UserPromptSubmit ?? []).flatMap((g) => g.hooks ?? []).find(mentionsNotice);
+  if (notice) {
+    compareToPayload('Codex notice hook script', FILES.notice);
+    const r = runHook(process.execPath, [FILES.notice[1]], JSON.stringify({ turn_id: `verify-${process.pid}`, cwd: HOME }));
+    const good = r.ok && typeof r.json.systemMessage === 'string' && r.json.systemMessage.includes('\u{1FAA8}');
+    check(good ? 'ok' : 'FAIL', 'Codex notice hook prints the icon', good ? r.json.systemMessage : r.detail ?? 'no systemMessage');
+    const trusted = (read(path.join(CODEX_DIR, 'config.toml')) ?? '').includes('user_prompt_submit');
+    check(trusted ? 'ok' : 'warn', 'Codex has approved a prompt hook', trusted ? 'trust entries present in config.toml' : 'open `codex` once and trust the new hook, or it never runs');
+  } else {
+    check('ok', 'Codex prompt notice', 'not installed');
+  }
+
   const copy = exists(CODEX_SKILL_COPY) && !isLink(CODEX_SKILL_COPY);
   check(copy ? 'warn' : 'ok', 'no duplicate caveman skill in ~/.codex/skills', copy ? `${CODEX_SKILL_COPY} is a separate copy; Codex would load two` : '');
   const override = process.env.CODEX_HOME;
@@ -556,15 +952,34 @@ function verify() {
 
 // ---------- main ----------
 
-const USAGE =
-  'usage: node caveman.mjs [install|verify|uninstall|export|help] [--dry-run] [--only claude|codex] [--home DIR] [--live]\n' +
-  '       no command = install (so `npx -y caveman-portable` sets up a device in one line)';
+const USAGE = [
+  'usage: node caveman.mjs [install|verify|uninstall|export|help] [options]',
+  '',
+  '  no command          install (so `npx -y caveman-portable` sets up a device in one line)',
+  '  --scope user        default: install for every project on this machine',
+  '  --scope project     install inside one repository only, nothing in the home directory',
+  '  --project DIR       which repository (default: the current directory)',
+  '  --shared            project scope: write .claude/settings.json (committed) instead of settings.local.json',
+  '  --icon display      default: draw the icon with a MessageDisplay hook',
+  '  --icon plugin       user scope only: use the experimental function-hook badge instead',
+  '  --icon none         no inline icon; the status line still shows the style',
+  '  --no-codex-notice   skip the per-prompt notice in Codex',
+  '  --only claude|codex limit the install to one tool',
+  '  --dry-run           show what would change',
+  '  --home DIR          treat DIR as the home directory (testing)',
+  '  --live              verify only: also run one real Claude and Codex prompt',
+].join('\n');
 
 try {
   if (ONLY && !['claude', 'codex'].includes(ONLY)) throw new Error('--only must be "claude" or "codex"');
+  if (!['display', 'plugin', 'none'].includes(ICON)) throw new Error('--icon must be "display", "plugin" or "none"');
+  if (!['user', 'project'].includes(SCOPE)) throw new Error('--scope must be "user" or "project"');
+  const project = SCOPE === 'project';
+  if (project && ICON === 'plugin') throw new Error('--icon plugin is user scope only: a plugin loads from the home directory, not from a project');
+  if (project && command === 'export') throw new Error('export refreshes the payload from a user-scope install; run it without --scope project');
   if (['install', 'uninstall', 'export'].includes(command)) {
-    if (command === 'install') install();
-    else if (command === 'uninstall') uninstall();
+    if (command === 'install') project ? installProject() : install();
+    else if (command === 'uninstall') project ? uninstallProject() : uninstall();
     else exportPayload();
     if (!actions.length) {
       console.log(command === 'export' ? 'payload already matches this device.' : 'already up to date; nothing to change.');
@@ -576,12 +991,13 @@ try {
     if (command !== 'export' && actions.length && !DRY) {
       const next = command === 'install' ? ', then run: node caveman.mjs verify' : '.';
       console.log(`Restart open Claude Code / Codex sessions to load the change${next}`);
+      for (const line of followUps) console.log(`  ! ${line}`);
     }
     if (command === 'uninstall' && actions.length) {
       console.log(`Not touched: Codex multi_agent (its default anyway) and ${EXPLANATORY_PLUGIN}; re-enable that plugin yourself if you want it.`);
     }
   } else if (command === 'verify') {
-    process.exitCode = verify();
+    process.exitCode = project ? verifyProject() : verify();
   } else {
     console.log(USAGE);
     process.exitCode = command === 'help' ? 0 : 1;

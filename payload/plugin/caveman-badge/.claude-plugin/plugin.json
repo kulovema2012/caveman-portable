@@ -1,0 +1,5 @@
+{
+  "name": "caveman-badge",
+  "version": "0.1.0",
+  "description": "Draws a rock badge on each assistant message while the caveman output style is active (function-hook version of the MessageDisplay hook)."
+}
