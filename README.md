@@ -50,8 +50,6 @@ node caveman.mjs install
 | `--icon display` | also draw the icon in front of each reply (a `MessageDisplay` hook) |
 | `--icon plugin` | user scope only: the experimental function-hook badge instead |
 | `--icon none` | default: no inline icon |
-| `--limit-guard 5` | default: once the weekly usage window has 5% left, each turn tells the agent to finish and push |
-| `--limit-guard off` | don't watch the weekly limit |
 | `--no-codex-notice` | skip the per-prompt notice in Codex |
 | `--only claude` / `--only codex` | limit the install to one tool |
 | `--dry-run` | show what would change |
@@ -66,7 +64,6 @@ Running install again is safe. It only changes what differs from the payload, an
 | `~/.claude/output-styles/caveman.md` | copied | Claude main conversation and forks |
 | `~/.claude/hooks/caveman-subagent.mjs` | copied | Gives every other Claude sub-agent (general-purpose, Explore, Plan, custom) the caveman rules; output styles don't reach them |
 | `~/.claude/hooks/caveman-statusline.mjs` + `caveman-statusline.json` | copied by default (`--statusline patch`) | The wrapper runs your existing status-line command and prefixes `🪨 caveman`; the `.json` holds your original command so uninstall restores it. It never edits your script, and it skips the badge if your script already prints it |
-| `~/.claude/hooks/caveman-limit.mjs` | copied by default (`--limit-guard 5`) | A `UserPromptSubmit` hook. Silent until the weekly window is nearly spent, then it states the figure, the reset time and the standing instruction to finish and push. Its reading comes from the status-line wrapper, since Claude Code hooks receive no usage data |
 | `~/.claude/hooks/caveman-display.mjs` | copied only with `--icon display` | Draws the icon in front of each reply, display-only |
 | `~/.claude/settings.json` | sets `outputStyle` to `"Caveman"`; registers the hook groups; disables `explanatory-output-style` if it is enabled | Merged: every other setting and hook is left alone |
 | `~/.agents/skills/caveman/SKILL.md` | copied | Shared skill. Codex reads this folder natively |
@@ -100,19 +97,6 @@ This writes into the repository and nothing else:
 | `AGENTS.md` | the caveman section, where Codex reads it for this repo |
 
 The hooks address their scripts through `${CLAUDE_PROJECT_DIR}`, so the settings file still works in another checkout or on another machine. Three notes: a personal skill of the same name wins over a project one, the Codex prompt notice is not available per project because Codex keeps hooks per home directory, and the status-line badge is left alone in this scope since a status line belongs to the machine, not the repository. `verify --scope project` checks this scope and reports both.
-
-## When the weekly limit runs low
-
-Both tools stop mid-task when a usage window runs out, which is the worst moment to lose uncommitted work. The guard watches the **weekly** window and, from 5% left (`--limit-guard`), adds one short note to each prompt: how much is left, when it resets, and your standing instruction — finish the work already in progress, commit the tracked changes on the current branch, push, and start nothing new. The agent decides what "finish" means; nothing is committed behind your back.
-
-Each tool needs a different reading, because neither exposes usage to hooks directly:
-
-| Tool | Where the figure comes from |
-|---|---|
-| Claude Code | The status line receives `rate_limits.seven_day`, so the wrapper records it in `caveman-limit.json` and the hook reads it on the next prompt. This is one more reason the status-line wrapper is the default. |
-| Codex | Every session file carries a live `rate_limits` snapshot, and hooks receive `transcript_path`, so the prompt notice reads the weekly window straight from the tail of that file. The notice then reads `🪨 caveman active · ⚠ 2.0% weekly limit left`. |
-
-With `--statusline none` on Claude nothing records the figure, so the guard there stays quiet; Codex is unaffected because it reads its own session file. Set a different trigger point with `--limit-guard 10`, or switch it off with `--limit-guard off`.
 
 ## Why these layers
 
