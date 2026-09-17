@@ -420,6 +420,37 @@ function patchStatusline(data) {
   data.statusLine = { ...(current ?? {}), type: 'command', command: wrapper };
 }
 
+// Status-line wrappers chain: another tool may have saved a pointer to this wrapper as *its* inner command.
+// Removing this one would leave that pointer dangling and silently drop everything beneath it, so hand each
+// sibling the command this wrapper was itself running. No tool needs to know any other tool exists.
+function repairSiblingWrappers() {
+  let inner = null;
+  try {
+    inner = JSON.parse(read(STATUSLINE_SIDECAR) ?? '{}')?.command ?? null;
+  } catch {
+    inner = null;
+  }
+  const dir = path.join(CLAUDE_DIR, 'hooks');
+  let names = [];
+  try {
+    names = fs.readdirSync(dir).filter((name) => name.endsWith('.json'));
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const file = path.join(dir, name);
+    if (file === STATUSLINE_SIDECAR) continue;
+    let data;
+    try {
+      data = JSON.parse(read(file) ?? 'null');
+    } catch {
+      continue;
+    }
+    if (!data || typeof data.command !== 'string' || !data.command.includes(STATUSLINE_SCRIPT)) continue;
+    writeText(file, JSON.stringify(inner ? { ...data, command: inner } : {}, null, 2) + '\n', 'another status-line wrapper pointed here; it now runs what this one wrapped');
+  }
+}
+
 function unpatchStatusline(data) {
   if (data.statusLine?.command !== wrapperCommand()) return;
   const saved = savedStatusline();
@@ -754,6 +785,7 @@ function install() {
     mergeSettings();
     // mergeSettings restores the saved command first, so the wrapper and its sidecar go afterwards.
     if (STATUSLINE !== 'patch') {
+      repairSiblingWrappers();
       deleteFile(FILES.statusline[1], 'status-line wrapper not selected');
       deleteFile(STATUSLINE_SIDECAR, 'saved status line no longer needed');
     }
@@ -781,6 +813,7 @@ function uninstall() {
     deleteFile(FILES.subagent[1], 'caveman SubagentStart hook');
     deleteFile(FILES.display[1], 'caveman MessageDisplay hook');
     // unmergeSettings already put the saved command back, so these two can go now.
+    repairSiblingWrappers();
     deleteFile(FILES.statusline[1], 'caveman status-line wrapper');
     deleteFile(STATUSLINE_SIDECAR, 'saved status line');
     removePluginFiles();
