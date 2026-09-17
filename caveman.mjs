@@ -31,6 +31,8 @@ const ONLY = optionValue('--only');
 // Codex has no customisable status line, so its per-prompt notice stays the default there.
 const ICON = optionValue('--icon') ?? 'none';
 const STATUSLINE = optionValue('--statusline') ?? 'patch';
+// Percent of the weekly window left at which the agent is told to wrap up and push, or "off".
+const LIMIT_GUARD = optionValue('--limit-guard') ?? '5';
 const CODEX_NOTICE_WANTED = !hasFlag('--no-codex-notice');
 const HOME_OVERRIDE = optionValue('--home');
 const HOME = path.resolve(HOME_OVERRIDE ?? os.homedir());
@@ -46,6 +48,8 @@ const SUBAGENT_HOOK = 'caveman-subagent.mjs';
 const DISPLAY_HOOK = 'caveman-display.mjs';
 const CODEX_NOTICE = 'caveman-notice.mjs';
 const STATUSLINE_SCRIPT = 'caveman-statusline.mjs';
+const LIMIT_HOOK = 'caveman-limit.mjs';
+const LIMIT_ENV = 'CAVEMAN_LIMIT_THRESHOLD';
 const EXPLANATORY_PLUGIN = 'explanatory-output-style@claude-plugins-official';
 const MARK_START = '<!-- caveman:start (managed by caveman-portable; edit payload/codex/AGENTS.caveman.md) -->';
 const MARK_END = '<!-- caveman:end -->';
@@ -66,6 +70,7 @@ const FILES = {
   display: [path.join(PAYLOAD, 'claude/hooks', DISPLAY_HOOK), path.join(CLAUDE_DIR, 'hooks', DISPLAY_HOOK)],
   notice: [path.join(PAYLOAD, 'codex/hooks', CODEX_NOTICE), path.join(CODEX_DIR, 'hooks', CODEX_NOTICE)],
   statusline: [path.join(PAYLOAD, 'claude/hooks', STATUSLINE_SCRIPT), path.join(CLAUDE_DIR, 'hooks', STATUSLINE_SCRIPT)],
+  limit: [path.join(PAYLOAD, 'claude/hooks', LIMIT_HOOK), path.join(CLAUDE_DIR, 'hooks', LIMIT_HOOK)],
   skill: [path.join(PAYLOAD, 'agents/skills/caveman/SKILL.md'), path.join(SHARED_SKILL_DIR, 'SKILL.md')],
 };
 // Holds whatever status-line command was configured before, so uninstall can put it back.
@@ -362,6 +367,16 @@ function mergeSettings() {
   else disablePluginInSettings(data);
   if (STATUSLINE === 'patch') patchStatusline(data);
   else unpatchStatusline(data);
+  // The status line is the only place Claude Code reports usage, so it records the weekly figure and this hook
+  // reads it. Threshold "0" parks the watch without removing anything else.
+  const threshold = LIMIT_GUARD === 'off' ? '0' : LIMIT_GUARD;
+  if (LIMIT_GUARD !== 'off') ensureHookGroup(data, 'UserPromptSubmit', FILES.limit[1], 'wrap up when the weekly limit runs low');
+  else dropHookGroup(data, 'UserPromptSubmit', LIMIT_HOOK);
+  if (data.env?.[LIMIT_ENV] !== threshold) {
+    note(`settings.json: set ${LIMIT_ENV}=${threshold}${LIMIT_GUARD === 'off' ? ' (weekly-limit watch off)' : '% of the weekly window'}`);
+    data.env ??= {};
+    data.env[LIMIT_ENV] = threshold;
+  }
   if (data.enabledPlugins?.[EXPLANATORY_PLUGIN] === true) {
     note(`settings.json: disable ${EXPLANATORY_PLUGIN} (its Insight blocks fight caveman)`);
     data.enabledPlugins[EXPLANATORY_PLUGIN] = false;
@@ -379,6 +394,12 @@ function unmergeSettings() {
   }
   dropHookGroup(data, 'SubagentStart', SUBAGENT_HOOK);
   dropHookGroup(data, 'MessageDisplay', DISPLAY_HOOK);
+  dropHookGroup(data, 'UserPromptSubmit', LIMIT_HOOK);
+  if (data.env?.[LIMIT_ENV] !== undefined) {
+    note(`settings.json: drop ${LIMIT_ENV}`);
+    delete data.env[LIMIT_ENV];
+    if (!Object.keys(data.env).length) delete data.env;
+  }
   disablePluginInSettings(data);
   unpatchStatusline(data);
   saveSettings(data, before);
@@ -710,6 +731,7 @@ function requirePayload() {
   const needed = [FILES.style[0], FILES.subagent[0], FILES.skill[0], AGENTS_SECTION];
   if (ICON === 'display') needed.push(FILES.display[0]);
   if (STATUSLINE === 'patch') needed.push(FILES.statusline[0]);
+  if (LIMIT_GUARD !== 'off') needed.push(FILES.limit[0]);
   if (ICON === 'plugin') needed.push(...PLUGIN_PARTS.map((rel) => path.join(PAYLOAD, 'plugin', rel)));
   if (CODEX_NOTICE_WANTED) needed.push(FILES.notice[0]);
   const missing = needed.filter((p) => !fs.existsSync(p));
@@ -750,6 +772,8 @@ function install() {
     if (ICON === 'plugin') installPluginFiles();
     else removePluginFiles();
     if (STATUSLINE === 'patch') writeText(FILES.statusline[1], read(FILES.statusline[0]), 'status-line wrapper: badge beside your own status line');
+    if (LIMIT_GUARD !== 'off') writeText(FILES.limit[1], read(FILES.limit[0]), 'weekly-limit guard: asks the agent to finish and push');
+    else deleteFile(FILES.limit[1], 'weekly-limit guard not selected');
     ensureClaudeSkillLink();
     mergeSettings();
     // mergeSettings restores the saved command first, so the wrapper and its sidecar go afterwards.
@@ -783,6 +807,8 @@ function uninstall() {
     // unmergeSettings already put the saved command back, so these two can go now.
     deleteFile(FILES.statusline[1], 'caveman status-line wrapper');
     deleteFile(STATUSLINE_SIDECAR, 'saved status line');
+    deleteFile(FILES.limit[1], 'caveman weekly-limit guard');
+    deleteFile(path.join(CLAUDE_DIR, 'hooks', 'caveman-limit.json'), 'recorded weekly-limit reading');
     removePluginFiles();
   }
   if (forCodex) {
@@ -803,7 +829,7 @@ function uninstall() {
 }
 
 function exportPayload() {
-  for (const key of ['style', 'subagent', 'display', 'statusline', 'skill', 'notice']) {
+  for (const key of ['style', 'subagent', 'display', 'statusline', 'limit', 'skill', 'notice']) {
     const [payloadCopy, installed] = FILES[key];
     const live = read(installed);
     if (live === null) {
@@ -884,6 +910,24 @@ function verifyClaude() {
     check(saved ? 'ok' : 'warn', 'your own status line is saved for uninstall', saved ?? 'none saved: uninstall will just drop the caveman status line');
   } else {
     check('ok', 'status-line badge', 'not installed');
+  }
+
+  const limitHook = (data.hooks?.UserPromptSubmit ?? []).flatMap((g) => g.hooks ?? []).find((h) => hookUses(h, LIMIT_HOOK));
+  if (limitHook) {
+    compareToPayload('weekly-limit guard script', FILES.limit);
+    let recorded = null;
+    try {
+      recorded = JSON.parse(read(path.join(CLAUDE_DIR, 'hooks', 'caveman-limit.json')) ?? 'null');
+    } catch {
+      // no reading yet
+    }
+    const threshold = data.env?.[LIMIT_ENV] ?? '5';
+    const detail = recorded
+      ? `${recorded.remaining.toFixed(1)}% of the weekly window left, recorded ${new Date(recorded.at).toLocaleTimeString()}`
+      : `armed at ${threshold}%; nothing recorded, so the weekly window still has room`;
+    check(threshold === '0' ? 'warn' : 'ok', 'weekly-limit guard', threshold === '0' ? 'threshold 0: the watch is parked' : detail);
+  } else {
+    check('ok', 'weekly-limit guard', 'not installed');
   }
 
   check(data.enabledPlugins?.[EXPLANATORY_PLUGIN] === true ? 'FAIL' : 'ok', 'explanatory-output-style plugin not enabled');
@@ -1050,6 +1094,8 @@ const USAGE = [
   '  --icon display      also draw the icon in front of each reply (a MessageDisplay hook)',
   '  --icon plugin       user scope only: the experimental function-hook badge instead',
   '  --icon none         default: no inline icon',
+  '  --limit-guard 5     default: with 5% of the weekly window left, tell the agent to finish and push',
+  '  --limit-guard off   do not watch the weekly limit',
   '  --no-codex-notice   skip the per-prompt notice in Codex',
   '  --only claude|codex limit the install to one tool',
   '  --dry-run           show what would change',
@@ -1061,6 +1107,9 @@ try {
   if (ONLY && !['claude', 'codex'].includes(ONLY)) throw new Error('--only must be "claude" or "codex"');
   if (!['display', 'plugin', 'none'].includes(ICON)) throw new Error('--icon must be "display", "plugin" or "none"');
   if (!['patch', 'print', 'none'].includes(STATUSLINE)) throw new Error('--statusline must be "patch", "print" or "none"');
+  if (LIMIT_GUARD !== 'off' && !(Number(LIMIT_GUARD) >= 0 && Number(LIMIT_GUARD) <= 100)) {
+    throw new Error('--limit-guard must be a percentage between 0 and 100, or "off"');
+  }
   if (!['user', 'project'].includes(SCOPE)) throw new Error('--scope must be "user" or "project"');
   const project = SCOPE === 'project';
   if (project && ICON === 'plugin') throw new Error('--icon plugin is user scope only: a plugin loads from the home directory, not from a project');

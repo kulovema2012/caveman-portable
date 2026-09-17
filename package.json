@@ -1,6 +1,6 @@
 {
   "name": "caveman-portable",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Caveman reply style for Claude Code and Codex: main agent and sub-agents, any device, no IDE or memory plugin needed",
   "type": "module",
   "bin": {
